@@ -10,7 +10,9 @@ services:
       SECURE_REQUEST_KEYS: "${SECURE_REQUEST_KEYS:-}"
       # 允许的请求时间戳偏差（秒），默认 300。
       SECURE_REQUEST_TIMESTAMP_SKEW: "${SECURE_REQUEST_TIMESTAMP_SKEW:-300}"
-      # nonce 保留窗口（秒），默认 2 倍时间偏差。
+      # nonce 基础保留窗口（秒），默认 2 倍时间偏差；实际保留到期自动取
+      # TTL 到期与信封最晚验收时刻（timestamp+SECURE_REQUEST_TIMESTAMP_SKEW）
+      # 两者中较晚者，TTL 小于时间偏差时窗口内重放仍返回 409。
       SECURE_REQUEST_NONCE_TTL: "${SECURE_REQUEST_NONCE_TTL:-600}"
       # nonce 防重放表容量上限（占位与已成功 nonce 合计），默认 10000。
       SECURE_REQUEST_NONCE_CAPACITY: "${SECURE_REQUEST_NONCE_CAPACITY:-10000}"

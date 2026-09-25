@@ -32,7 +32,9 @@
 - `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
   （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
-  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
+  密钥验签、限制时间偏差，并对 `key_id+nonce` 做防重放：验签通过后
+  nonce 保留到配置 TTL 到期与该信封时间戳允许的最晚验收时刻两者中较晚者
+  之后，时间偏差大于 TTL 时窗口内重放同样返回 `409`。验签通过后
   执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
 - `POST /safe-download-name`：解析上游 `Content-Disposition` 响应头，返回可
   直接用作本地下载文件名的**单一安全名称**。优先采用符合 RFC 5987 的
@@ -79,23 +81,36 @@
 
 ## Docker 一键启动
 
-需要 Docker 20.10+（支持 Compose v2）。在工作目录准备好 `.env`（可从
-`.env.example` 复制；只需 `/plan`、`/assemble` 等无鉴权端点时也可留空），
-再用**单条命令**构建并启动：
+需要 Docker 20.10+（支持 Compose v2）。无需创建任何文件，在工作目录用
+**单条命令**构建并启动（HMAC 密钥等配置可直接以内联环境变量注入）：
+
+```
+SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef' \
+  docker compose up --build
+```
+
+只使用 `/plan`、`/assemble` 等无鉴权端点时，可省略前面的环境变量，
+直接运行：
 
 ```
 docker compose up --build
 ```
 
-- 访问地址：http://127.0.0.1:8080 （服务监听容器内 8080 端口，Compose
-  映射 `127.0.0.1:8080:8080`，仅绑定本机回环地址，不对局域网/公网暴露）
+也可以在工作目录准备 `.env`（可从 `.env.example` 复制；只需 `/plan`、
+`/assemble` 等无鉴权端点时也可留空），Compose 会自动读取，命令不变。
+
+启动后通过 **8080 端口**访问（容器内固定监听 8080，Compose 映射
+`127.0.0.1:8080:8080`，仅绑定本机回环地址，不对局域网/公网暴露）：
+
+- 服务地址：http://127.0.0.1:8080
 - 接口文档（Swagger UI）：http://127.0.0.1:8080/docs
 - 健康检查：`curl http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
 
 `/secure-request` 的 `SECURE_REQUEST_KEYS` /
 `SECURE_REQUEST_TIMESTAMP_SKEW` / `SECURE_REQUEST_NONCE_TTL` /
-`SECURE_REQUEST_NONCE_CAPACITY` 均由 Compose 从同目录 `.env` 读取（默认值
-见下节“配置”），无需修改 `docker-compose.yml`。
+`SECURE_REQUEST_NONCE_CAPACITY` 均由 Compose 读取：默认值见下节“配置”，
+可在命令前以内联环境变量覆盖（如上文示例），或写入同目录 `.env` 由
+Compose 自动读取，无需修改 `docker-compose.yml`。
 
 上述命令在前台运行并输出日志，`Ctrl+C` 停止；追加 `-d` 可后台启动，
 此后可用 `docker compose logs -f` 查看日志、`docker compose down` 停止。
@@ -116,7 +131,7 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | --- | --- | --- | --- |
 | `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
-| `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
+| `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的基础防重放保留窗口（秒）。**实际保留到期时刻取“TTL 到期（验签时刻 + TTL）”与“该信封时间戳允许的最晚验收时刻（`timestamp + SECURE_REQUEST_TIMESTAMP_SKEW`）”两者中较晚者**，因此即使 TTL 配置得比时间偏差小，同一签名信封在整个允许时间窗内重放仍返回 `409`；信封时间窗结束且保留期届满后 nonce 才允许复用 |
 | `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | 进程内 nonce 防重放表的容量上限（正整数）；**进行中占位与窗口内已成功 nonce 统一计数**，容量已满且无过期项可清理时返回 `503 nonce_capacity_exceeded`（附 `capacity`），不会驱逐任何未过期 nonce |
 
 未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
@@ -766,10 +781,11 @@ envelope["signature"] = hmac.new(
    → `401 timestamp_skew`（响应附带 `server_time` 与 `max_skew_seconds`）；
 3. `key_id` 在密钥表中不存在 → `401 unknown_key_id`；
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
-5. 在**同一把锁内**依次完成 nonce 处理：先按**到期时间索引**清理已到期
-   nonce（索引按到期时间推进，每次只从头部弹出已到期条目，不扫描未过期
+5. 在**同一把锁内**依次完成 nonce 处理：先按**到期时间索引**清理保留期
+   已届满的 nonce（到期时刻本身仍受保护，严格晚于到期时刻才弹出；索引
+   按保留到期时间推进，每次只从头部弹出已到期条目，不扫描未过期
    nonce）→ 再识别重放 → 最后为新 nonce 预留名额：
-   - 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
+   - 同一 `key_id+nonce` 仍在保留期内
      → `409 nonce_replayed`（即使容量已满，重放仍优先返回 `409`）；
    - 防重放表达到 `SECURE_REQUEST_NONCE_CAPACITY`（进行中占位与已成功
      nonce 合计）且清理后仍无空位 → `503 nonce_capacity_exceeded`（附
@@ -777,6 +793,20 @@ envelope["signature"] = hmac.new(
 6. 校验 `payload` 并执行对应操作：字段错误返回 `422 invalid_request`
    （错误路径以 `payload.` 开头，如 `payload.ranges[0].end`），
    业务语义错误沿用 `/plan`、`/assemble` 的 `422` 错误结构。
+
+每次验签通过后，nonce 的**保留到期时刻**取以下两者中较晚者（主表与到期
+堆索引使用同一时刻）：
+
+- 配置 TTL 到期：`验签时刻 + SECURE_REQUEST_NONCE_TTL`；
+- 该信封时间戳仍可被验收的最晚时刻：`timestamp + SECURE_REQUEST_TIMESTAMP_SKEW`。
+
+因此 `SECURE_REQUEST_NONCE_TTL` 与时间偏差没有大小约束：即使 TTL 小于
+时间偏差，同一合法签名信封在**整个允许时间窗内**（含最晚验收时刻
+`timestamp + skew` 本身）重放都返回 `409`，不会执行第二次。信封时间窗
+结束且保留期届满（服务端时间严格晚于保留到期时刻）后，nonce 才允许被
+复用——旧信封此刻本身也已超出时间偏差（`401 timestamp_skew`），用同
+nonce 构造的新信封（新时间戳、新签名）可正常提交。保留顺延期间记录照样
+占用容量名额，容量已满时新 nonce 仍返回 `503`（重放优先，仍为 `409`）。
 
 只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
@@ -1602,7 +1632,7 @@ python examples/cache_read_plan_example.py
 | 401  | `timestamp_skew`      | 时间戳超出允许偏差（附 `server_time`、`max_skew_seconds`） |
 | 401  | `unknown_key_id`      | 密钥表中不存在该 `key_id`（附 `key_id`）          |
 | 401  | `invalid_signature`   | HMAC-SHA256 签名不符                              |
-| 409  | `nonce_replayed`      | 同一 `key_id+nonce` 在有效窗口内已成功使用（附 `key_id`） |
+| 409  | `nonce_replayed`      | 同一 `key_id+nonce` 仍在保留期内（TTL 到期与信封最晚验收时刻 `timestamp+skew` 两者中较晚者；附 `key_id`） |
 | 503  | `keys_not_configured` | 服务端未配置 `SECURE_REQUEST_KEYS`，鉴权入口不可用 |
 | 503  | `nonce_capacity_exceeded` | nonce 防重放表已达容量上限且无过期项可清理（附 `capacity`），不驱逐未过期 nonce、不执行 payload |
 
