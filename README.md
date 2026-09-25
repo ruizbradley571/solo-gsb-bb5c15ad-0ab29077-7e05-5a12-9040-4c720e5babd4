@@ -79,18 +79,23 @@
 
 ## Docker 一键启动
 
-需要 Docker 20.10+（支持 Compose v2）。在工作目录准备好 `.env`（可从
+需要 Docker 20.10+（支持 Compose v2）。在仓库根目录准备好 `.env`（可从
 `.env.example` 复制；只需 `/plan`、`/assemble` 等无鉴权端点时也可留空），
-再用**单条命令**构建并启动：
+再用**单条命令**构建镜像并启动服务，无需其他参数、额外容器或手动构建：
 
 ```
 docker compose up --build
 ```
 
-- 访问地址：http://127.0.0.1:8080 （服务监听容器内 8080 端口，Compose
-  映射 `127.0.0.1:8080:8080`，仅绑定本机回环地址，不对局域网/公网暴露）
-- 接口文档（Swagger UI）：http://127.0.0.1:8080/docs
+启动成功后通过宿主机 **8080** 端口访问（容器内固定监听 8080，Compose
+映射 `127.0.0.1:8080:8080`，仅绑定本机回环地址，不对局域网/公网暴露；
+根路径 `/` 未定义页面，请从下列地址进入）：
+
+- 接口文档（Swagger UI，浏览器直接打开即可调试全部接口）：
+  http://127.0.0.1:8080/docs
 - 健康检查：`curl http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
+- 各接口基址：`http://127.0.0.1:8080`（如
+  `POST http://127.0.0.1:8080/secure-request`）
 
 `/secure-request` 的 `SECURE_REQUEST_KEYS` /
 `SECURE_REQUEST_TIMESTAMP_SKEW` / `SECURE_REQUEST_NONCE_TTL` /
@@ -116,7 +121,7 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 | --- | --- | --- | --- |
 | `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
 | `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
-| `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
+| `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒）。每次验签通过后，nonce 实际保留到「配置 TTL 到期」与「该信封最晚验收时刻 `timestamp + SECURE_REQUEST_TIMESTAMP_SKEW`」两者中**较晚者之后**（该时刻同时用于主表与到期索引），因此即使把 TTL 配得小于时间偏差，仍在时间窗内的合法信封重放也会被 `409` 拒绝（最晚验收时刻本身同样拒绝）；信封时间窗结束且保留期届满后，同一 nonce 可随新时间戳的信封复用 |
 | `SECURE_REQUEST_NONCE_CAPACITY` | 否 | `10000` | 进程内 nonce 防重放表的容量上限（正整数）；**进行中占位与窗口内已成功 nonce 统一计数**，容量已满且无过期项可清理时返回 `503 nonce_capacity_exceeded`（附 `capacity`），不会驱逐任何未过期 nonce |
 
 未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble`、
@@ -768,8 +773,11 @@ envelope["signature"] = hmac.new(
 4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
 5. 在**同一把锁内**依次完成 nonce 处理：先按**到期时间索引**清理已到期
    nonce（索引按到期时间推进，每次只从头部弹出已到期条目，不扫描未过期
-   nonce）→ 再识别重放 → 最后为新 nonce 预留名额：
-   - 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
+   nonce；到期时刻本身仍视为有效，记录保留到到期时刻之后）→ 再识别重放
+   → 最后为新 nonce 预留名额（到期时刻取 `now + SECURE_REQUEST_NONCE_TTL`
+   与该信封最晚验收时刻 `timestamp + SECURE_REQUEST_TIMESTAMP_SKEW` 两者中
+   较晚者，主表与到期索引使用同一到期时刻）：
+   - 同一 `key_id+nonce` 仍在保留窗口内
      → `409 nonce_replayed`（即使容量已满，重放仍优先返回 `409`）；
    - 防重放表达到 `SECURE_REQUEST_NONCE_CAPACITY`（进行中占位与已成功
      nonce 合计）且清理后仍无空位 → `503 nonce_capacity_exceeded`（附
@@ -785,7 +793,11 @@ envelope["signature"] = hmac.new(
 主表、不随失败请求次数增长；若该占位恰好已过期并被并发请求重新占用，
 原有记录不会被误删。到期索引中的每条条目同样携带占位令牌：同名 nonce
 到期后被重新占用时，遗留的索引条目在弹出时会因与主表记录不符而被直接
-丢弃，不会误删新占位。重放已成功的 nonce 返回 `409`。
+丢弃，不会误删新占位。即使 `SECURE_REQUEST_NONCE_TTL` 被配成小于时间
+偏差，验签通过的 nonce 也会保留到该信封最晚验收时刻之后——时间窗内
+（含最晚验收时刻本身）的重放始终返回 `409`；信封时间窗结束（旧信封
+改由第 2 步以 `401 timestamp_skew` 拒绝）且保留期届满后，同一 nonce
+才可随新时间戳、新签名的信封复用。重放已成功的 nonce 返回 `409`。
 
 ### `POST /safe-download-name`
 

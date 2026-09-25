@@ -15,6 +15,9 @@
 - 释放占位时若该记录已过期并被并发请求重新占用，不能误删新记录；
 - 索引条目携带占位令牌：同名 nonce 到期后重新占用时，遗留的索引条目
   弹出时不得删除主表中的新占位；
+- SECURE_REQUEST_NONCE_TTL 小于时间偏差时，验签通过的 nonce 仍保留到
+  该信封时间戳允许的最晚验收时刻之后（最晚验收时刻本身仍拒绝重放），
+  信封时间窗结束且保留期届满后同一 nonce 可随新信封复用；
 - SECURE_REQUEST_NONCE_CAPACITY 默认 10000 且必须为正整数。
 
 直接运行：python -m unittest discover -s tests
@@ -30,6 +33,7 @@ import os
 import threading
 import time
 import unittest
+import unittest.mock
 import uuid
 
 from app import main
@@ -415,6 +419,195 @@ class SecureRequestTests(unittest.TestCase):
         with _nonce_lock:
             self.assertEqual(len(_nonce_seen), main.secure_config.nonce_capacity)
             self.assertEqual(len(_nonce_expiry_index), main.secure_config.nonce_capacity)
+
+
+@unittest.skipIf(TestClient is None, "需要安装 starlette（随 fastapi 安装）")
+class SecureRequestNonceRetentionTests(unittest.TestCase):
+    """SECURE_REQUEST_NONCE_TTL 小于时间偏差时的重放修复回归测试。
+
+    配置 nonce_ttl=60 远小于 timestamp_skew=300：只按 TTL 保留 nonce
+    会在信封仍处于允许时间窗时放过重放；修复后保留期延长到该信封的
+    最晚验收时刻（timestamp + skew），窗口内（含最晚验收时刻本身）
+    一律 409，时间窗结束且保留期届满后 nonce 才可复用。
+    """
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+        # 进程级单例：注入密钥、时间偏差与（故意偏小的）nonce TTL，
+        # 并清空防重放主表与到期索引。
+        self._orig_keys = main.secure_config.keys
+        self._orig_capacity = main.secure_config.nonce_capacity
+        self._orig_ttl = main.secure_config.nonce_ttl
+        self._orig_skew = main.secure_config.timestamp_skew
+        main.secure_config.keys = {KEY_ID: SECRET}
+        main.secure_config.nonce_capacity = 4
+        main.secure_config.nonce_ttl = 60
+        main.secure_config.timestamp_skew = 300
+        with _nonce_lock:
+            _nonce_seen.clear()
+            _nonce_expiry_index.clear()
+
+    def tearDown(self) -> None:
+        main.secure_config.keys = self._orig_keys
+        main.secure_config.nonce_capacity = self._orig_capacity
+        main.secure_config.nonce_ttl = self._orig_ttl
+        main.secure_config.timestamp_skew = self._orig_skew
+        with _nonce_lock:
+            _nonce_seen.clear()
+            _nonce_expiry_index.clear()
+
+    def _envelope(
+        self,
+        payload: dict,
+        *,
+        nonce: str | None = None,
+        timestamp: int | None = None,
+    ) -> dict:
+        envelope = {
+            "operation": "plan",
+            "payload": payload,
+            "key_id": KEY_ID,
+            "timestamp": int(time.time()) if timestamp is None else timestamp,
+            "nonce": uuid.uuid4().hex if nonce is None else nonce,
+        }
+        envelope["signature"] = hmac.new(
+            SECRET, canonical_json(envelope), hashlib.sha256
+        ).hexdigest()
+        return envelope
+
+    def _post(self, envelope: dict, *, at: float | None = None):
+        """提交信封；at 给出时把服务端时钟固定到该时刻。"""
+        if at is None:
+            return self.client.post("/secure-request", json=envelope, headers={})
+        with unittest.mock.patch("app.main.time.time", return_value=at):
+            return self.client.post("/secure-request", json=envelope, headers={})
+
+    def test_replay_blocked_until_envelope_deadline_when_ttl_below_skew(self) -> None:
+        t0 = 1_000_000.0
+        envelope = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="ttl-fix", timestamp=int(t0)
+        )
+        resp = self._post(envelope, at=t0)
+        self.assertEqual(resp.status_code, 200)
+
+        # 到期取 max(t0+TTL= t0+60, t0+skew= t0+300)，主表与堆索引一致。
+        with _nonce_lock:
+            expiry, token = _nonce_seen[(KEY_ID, "ttl-fix")]
+            self.assertIn(
+                (expiry, token, (KEY_ID, "ttl-fix")), _nonce_expiry_index
+            )
+        self.assertEqual(expiry, t0 + 300)
+
+        # 配置 TTL 已过但信封仍在时间窗内：同一信封重放必须 409，
+        # 而不是第二次执行（修复前此处 nonce 已被清理，会再次 200）。
+        resp = self._post(envelope, at=t0 + 120)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["error"], "nonce_replayed")
+
+        # 最晚验收时刻本身仍拒绝重放（到期判定为严格小于）。
+        resp = self._post(envelope, at=t0 + 300)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["error"], "nonce_replayed")
+        with _nonce_lock:
+            self.assertIn((KEY_ID, "ttl-fix"), _nonce_seen)
+
+        # 时间窗结束：旧信封先因时间偏差被拒（401），与 nonce 无关。
+        resp = self._post(envelope, at=t0 + 301)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "timestamp_skew")
+
+        # 保留期届满后 nonce 允许复用：新时间戳 + 新签名的信封执行成功。
+        reused = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="ttl-fix", timestamp=int(t0 + 301)
+        )
+        resp = self._post(reused, at=t0 + 301)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["object_length"], 256)
+        # 复用后该 nonce 重新进入防重放保护。
+        self.assertEqual(self._post(reused, at=t0 + 301).status_code, 409)
+
+    def test_ttl_larger_than_skew_keeps_configured_ttl(self) -> None:
+        main.secure_config.nonce_ttl = 600
+        t0 = 2_000_000.0
+        envelope = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="ttl-long", timestamp=int(t0)
+        )
+        resp = self._post(envelope, at=t0)
+        self.assertEqual(resp.status_code, 200)
+        with _nonce_lock:
+            expiry, _token = _nonce_seen[(KEY_ID, "ttl-long")]
+        self.assertEqual(expiry, t0 + 600)
+
+    def test_reserve_retention_floor_drives_table_and_index(self) -> None:
+        with _nonce_lock:
+            status, reservation = _reserve_nonce(
+                (KEY_ID, "direct"), 100.0, retain_until=500.0
+            )
+            self.assertEqual(status, "reserved")
+            # 到期取 TTL（100+60=160）与 retain_until（500）中较晚者。
+            self.assertEqual(reservation[0], 500.0)
+            self.assertEqual(_nonce_seen[(KEY_ID, "direct")], reservation)
+            self.assertIn(
+                (500.0, reservation[1], (KEY_ID, "direct")), _nonce_expiry_index
+            )
+
+            # retain_until 早于 TTL 到期时仍按配置 TTL。
+            status2, reservation2 = _reserve_nonce(
+                (KEY_ID, "direct2"), 100.0, retain_until=50.0
+            )
+            self.assertEqual(status2, "reserved")
+            self.assertEqual(reservation2[0], 160.0)
+
+            # 到期时刻（500）本身保留，之后才清理（到期 160 的一项一并清理）。
+            _sweep_nonces(500.0)
+            self.assertIn((KEY_ID, "direct"), _nonce_seen)
+            self.assertNotIn((KEY_ID, "direct2"), _nonce_seen)
+            self.assertEqual(len(_nonce_expiry_index), 1)
+            _sweep_nonces(500.0 + 1e-9)
+            self.assertNotIn((KEY_ID, "direct"), _nonce_seen)
+            self.assertEqual(len(_nonce_expiry_index), 0)
+
+    def test_window_entries_held_for_capacity_and_409_takes_precedence(self) -> None:
+        # 4 条记录的到期时刻为各自信封的最晚验收时刻 400..403
+        # （TTL=60 远早于此），表写满容量 4。
+        with _nonce_lock:
+            for i in range(4):
+                status, _ = _reserve_nonce(
+                    (KEY_ID, f"keep-{i}"), now=100.0 + i, retain_until=400.0 + i
+                )
+                self.assertEqual(status, "reserved")
+            self.assertEqual(len(_nonce_seen), 4)
+
+        # 最晚验收时刻 400 本身：无任何可清理项，容量仍满 → 新 nonce 503。
+        fresh = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="newcomer", timestamp=100
+        )
+        self.assertEqual(self._post(fresh, at=400.0).status_code, 503)
+
+        # 同一时刻重放 keep-0（信封 timestamp=100，最晚验收时刻 400）：
+        # 409 优先于 503。
+        replay = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="keep-0", timestamp=100
+        )
+        resp = self._post(replay, at=400.0)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["error"], "nonce_replayed")
+
+        # 时刻 402：keep-0/keep-1 已过最晚验收时刻，被同锁清理腾名额；
+        # keep-2 的最晚验收时刻（402）本身仍保留，重放返回 409。
+        fresh2 = self._envelope(
+            dict(PLAN_PAYLOAD), nonce="newcomer", timestamp=102
+        )
+        self.assertEqual(self._post(fresh2, at=402.0).status_code, 200)
+        resp = self._post(
+            self._envelope(dict(PLAN_PAYLOAD), nonce="keep-2", timestamp=102),
+            at=402.0,
+        )
+        self.assertEqual(resp.status_code, 409)
+        with _nonce_lock:
+            self.assertIn((KEY_ID, "keep-2"), _nonce_seen)
+            self.assertNotIn((KEY_ID, "keep-0"), _nonce_seen)
+            self.assertNotIn((KEY_ID, "keep-1"), _nonce_seen)
 
 
 class NonceCapacityConfigTests(unittest.TestCase):

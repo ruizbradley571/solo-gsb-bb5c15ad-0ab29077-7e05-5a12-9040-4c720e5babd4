@@ -35,6 +35,10 @@ POST /secure-request 是 /plan 与 /assemble 的统一鉴权入口：请求携�
 operation（plan 或 assemble）、payload（即原接口请求体）、key_id、
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
 HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
+验签通过后，nonce 保留到「配置 TTL 到期」与「该信封时间戳允许的最晚
+验收时刻（timestamp + SECURE_REQUEST_TIMESTAMP_SKEW）」两者中较晚者
+之后——即使 SECURE_REQUEST_NONCE_TTL 小于时间偏差，最晚验收时刻本身
+仍拒绝重放；信封时间窗结束且保留期届满后 nonce 方可复用。
 防重放表为有界容量（进行中占位与窗口内已成功 nonce 合计，默认 10000）：
 同一把锁内先按到期时间索引清理已到期项（只从索引头部弹出到期条目，
 不扫描未过期 nonce）、再识别重放、最后为新 nonce 预留名额；容量已满
@@ -161,7 +165,9 @@ class SecureRequestConfig:
     - SECURE_REQUEST_KEYS：逗号分隔的 ``key_id=secret`` 列表，secret 为
       原始 UTF-8 密钥字节（如含特殊字符建议用仅含字母数字/base64 字符的密钥）。
     - SECURE_REQUEST_TIMESTAMP_SKEW：允许的时间偏差（秒），默认 300。
-    - SECURE_REQUEST_NONCE_TTL：nonce 保留时长（秒），默认取 2 倍偏差。
+    - SECURE_REQUEST_NONCE_TTL：nonce 保留时长（秒），默认取 2 倍偏差；
+      实际保留期会延长到不早于该信封时间戳允许的最晚验收时刻，因此
+      小于时间偏差的取值同样不会放开口子。
     - SECURE_REQUEST_NONCE_CAPACITY：进程内 nonce 防重放表的容量上限
       （进行中占位与窗口内已成功 nonce 合计），默认 10000。
     """
@@ -222,16 +228,17 @@ def _sweep_nonces(now: float) -> None:
     只处理到期项：按到期时间索引从堆顶依次弹出已到期条目；弹出的条目与
     主表记录（到期时间戳 + 占位令牌）逐字一致时才删除主表项，不一致即为
     遗留条目（同名 nonce 已到期并被重新占用），直接丢弃，绝不动主表中
-    的新占位。
+    的新占位。到期判定为严格小于：记录保留到到期时刻之后，到期时刻本身
+    仍视为有效——保证信封的最晚验收时刻本身仍拒绝重放。
     """
-    while _nonce_expiry_index and _nonce_expiry_index[0][0] <= now:
+    while _nonce_expiry_index and _nonce_expiry_index[0][0] < now:
         expiry, token, nonce_key = heapq.heappop(_nonce_expiry_index)
         if _nonce_seen.get(nonce_key) == (expiry, token):
             del _nonce_seen[nonce_key]
 
 
 def _reserve_nonce(
-    nonce_key: tuple[str, str], now: float
+    nonce_key: tuple[str, str], now: float, retain_until: float | None = None
 ) -> tuple[str, tuple[float, int] | None]:
     """在同一把锁内完成防重放判断与名额预留（调用方需持有 _nonce_lock）。
 
@@ -241,6 +248,12 @@ def _reserve_nonce(
     ``("full", None)``（调用方据此返回 503，绝不驱逐未过期 nonce）；
     重放返回 ``("replayed", None)``（409 优先于 503）；预留成功返回
     ``("reserved", (到期时间戳, 占位令牌))``。
+
+    到期时间取 ``now + SECURE_REQUEST_NONCE_TTL`` 与 ``retain_until``
+    （该信封时间戳允许的最晚验收时刻）两者中较晚者，主表与到期索引使用
+    同一到期时刻：即使配置的 TTL 小于时间偏差，nonce 也保留到信封时间
+    窗结束之后，窗口内的重放始终被 409 拒绝；信封时间窗结束且保留期
+    届满后，同名 nonce 才允许复用。
     """
     _sweep_nonces(now)
     if nonce_key in _nonce_seen:
@@ -249,6 +262,8 @@ def _reserve_nonce(
         return "full", None
     token = secrets.randbits(64)
     expiry = now + secure_config.nonce_ttl
+    if retain_until is not None and retain_until > expiry:
+        expiry = retain_until
     reservation = (expiry, token)
     _nonce_seen[nonce_key] = reservation
     heapq.heappush(_nonce_expiry_index, (expiry, token, nonce_key))
@@ -2740,6 +2755,10 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
             server_time=int(now),
             max_skew_seconds=secure_config.timestamp_skew,
         )
+    # 该信封时间戳允许的最晚验收时刻：nonce 至少保留到该时刻之后，
+    # 即使 SECURE_REQUEST_NONCE_TTL 小于时间偏差，窗口内（含该时刻
+    # 本身）的重放也始终被 409 拒绝。
+    acceptance_deadline = raw.timestamp + secure_config.timestamp_skew
 
     # 2. key_id 未知：明确报错（不与签名失败混淆，便于客户端定位）。
     secret = secure_config.keys.get(raw.key_id)
@@ -2775,15 +2794,19 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
     # 4. nonce 防重放：同一 key_id+nonce 在有效窗口内只能成功一次。
     #    在同一把锁内完成“按到期索引清理过期项 → 识别重放 → 为新 nonce
     #    预留名额”：清理只从索引头部弹出已到期条目，不扫描未过期 nonce，
-    #    且清理/判重/占位之间没有并发窗口。先占位；若后续 payload 校验或
-    #    操作执行失败则回滚（主表记录与到期索引条目一并移除，失效索引
-    #    立即回收），避免失败请求白白消耗 nonce（只有真正成功的请求才
-    #    永久占用）。容量对进行中占位与窗口内已成功 nonce 统一计数，
-    #    已满且无过期项时拒绝执行（503），绝不驱逐任何未过期 nonce；
-    #    409 重放优先于 503 容量不足。
+    #    且清理/判重/占位之间没有并发窗口。到期时刻取“配置 TTL 到期”与
+    #    “该信封时间戳允许的最晚验收时刻”两者中较晚者，主表与到期索引
+    #    使用同一时刻——TTL 小于时间偏差也不会在信封窗口内放开口子。
+    #    先占位；若后续 payload 校验或操作执行失败则回滚（主表记录与
+    #    到期索引条目一并移除，失效索引立即回收），避免失败请求白白消耗
+    #    nonce（只有真正成功的请求才永久占用）。容量对进行中占位与窗口
+    #    内已成功 nonce 统一计数，已满且无过期项时拒绝执行（503），绝不
+    #    驱逐任何未过期 nonce；409 重放优先于 503 容量不足。
     nonce_key = (raw.key_id, raw.nonce)
     with _nonce_lock:
-        status, reservation = _reserve_nonce(nonce_key, now)
+        status, reservation = _reserve_nonce(
+            nonce_key, now, retain_until=float(acceptance_deadline)
+        )
         if status == "replayed":
             return _auth_error(
                 "nonce_replayed",
